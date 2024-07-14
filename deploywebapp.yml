@@ -1,0 +1,404 @@
+#### https://docs.aws.amazon.com/eks/latest/userguide/quickstart.html
+Prerequisites:
+- Set up to use Amazon EKS
+- Install Helm
+
+Step 1: 
+Configure the cluster
+
+In this section, you’ll create a managed node group-based cluster 
+using t3.medium instances containing two nodes. 
+The configuration includes a service account for AWS Load Balancer Controller (LBC) 
+add-on, and installation of the latest version of the AWS Amazon EBS CSI driver. 
+For all available eksctl add-ons.
+Create a "cluster-config.yaml" file and paste the following contents into it. 
+Replace region-code with a valid region "us-east-1"
+
+> nano cluster-config.yaml
+`
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: demo-cluster
+  region: us-east-1
+
+managedNodeGroups:
+  - name: eks-mng
+    instanceType: t3.medium
+    desiredCapacity: 3
+
+iam:
+  withOIDC: true
+  serviceAccounts:
+  - metadata:
+      name: aws-load-balancer-controller
+      namespace: kube-system
+    wellKnownPolicies:
+      awsLoadBalancerController: true
+
+addons:
+  - name: aws-ebs-csi-driver
+    wellKnownPolicies: # Adds an IAM service account
+      ebsCSIController: true
+      
+cloudWatch:
+ clusterLogging:
+   enableTypes: ["*"]
+   logRetentionInDays: 30
+`
+
+Step 2: 
+Create the cluster
+
+> eksctl create cluster -f cluster-config.yaml
+
+Step 3: 
+Set up external access to applications using the AWS Load Balancer Controller (LBC)
+
+With the cluster operational, our next step is making its containerized applications accessible externally. 
+This is accomplished by deploying an Application Load Balancer (ALB) to direct traffic outside the cluster to our services, 
+in other words, our applications. When we created our cluster, we established an IAM Roles for Service Accounts (IRSA) 
+for the Load Balancer Controller (LBC) with the permissions needed to dynamically create ALBs, 
+facilitating external traffic routing to our Kubernetes services. In this section, we’ll set up the AWS LBC on our cluster.
+
+To configure environment variables;
+- Set the CLUSTER_REGION environment variable for your Amazon EKS cluster.
+  > export CLUSTER_REGION=us-east-1
+
+- Set the CLUSTER_VPC environment variable for your Amazon EKS cluster.
+  > export CLUSTER_VPC=$(aws eks describe-cluster --name web-quickstart --region $CLUSTER_REGION --query "cluster.resourcesVpcConfig.vpcId" --output text)
+
+To install the AWS Load Balancer Controller (LBC);
+The AWS Load Balancer Controller (LBC) leverages Custom Resource Definitions (CRDs) in Kubernetes to manage AWS Elastic Load Balancers (ELBs). 
+These CRDs define custom resources such as load balancers and TargetGroupBindings, enabling the Kubernetes cluster to recognize and manage them.
+
+- Use Helm to add the Amazon EKS chart repository to Helm;
+  > helm repo add eks https://aws.github.io/eks-charts
+
+- Update the repositories to ensure Helm is aware of the latest versions of the charts;
+  > helm repo update eks
+
+- Run the following Helm command to simultaneously install the Custom Resource Definitions (CRDs) and the main controller for the AWS Load Balancer Controller (AWS LBC). 
+To skip the CRD installation, pass the --skip-crds flag, which might be useful if the CRDs are already installed, if specific version compatibility is required, 
+or in environments with strict access control and customization needs.
+
+`
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+    --namespace kube-system \
+    --set clusterName=demo-cluster \
+    --set serviceAccount.create=false \
+    --set region=${CLUSTER_REGION} \
+    --set vpcId=${CLUSTER_VPC} \
+    --set serviceAccount.name=aws-load-balancer-controller
+`
+Step 4: Deploy the 2048 game sample application:
+Now that the load balancer is set up, it's time to enable external access 
+for containerized applications in the cluster.
+lets deploy the popular “2048 game” as a sample application within the cluster
+
+The provided manifest includes custom annotations for the Application Load Balancer (ALB), 
+specifically the 'scheme' annotation and 'target-type' annotation. These annotations 
+integrate with and instruct the AWS Load Balancer Controller (LBC) to handle incoming HTTP 
+traffic as "internet-facing" and route it to the appropriate service in the 'game-2048' namespace using the target type "ip".
+
+- Create a Kubernetes namespace called game-2048 with the --save-config flag.
+  > kubectl create namespace game-2048 --save-config
+
+- Deploy the 2048 Game Sample application.
+  > kubectl apply -n game-2048 -f https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.8.0/docs/examples/2048/2048_full.yaml
+
+This manifest sets up a Kubernetes Deployment, Service, and Ingress for the game-2048 namespace, creating the necessary resources to 
+deploy and expose the game-2048 application within the cluster. 
+It includes the creation of a service named service-2048 that exposes the deployment on port 80, 
+and an Ingress resource named ingress-2048 that defines routing rules for incoming HTTP traffic and 
+annotations for an internet-facing Application Load Balancer (ALB).
+
+- Run the following command to get the Ingress resource for the game-2048 namespace.
+  > kubectl get ingress -n game-2048
+
+You’ll need to wait several minutes for the Application Load Balancer (ALB) to provision before you begin the following steps.
+
+-  Open a web browser and enter the ADDRESS from the previous step to access the web 
+application. For example, k8s-game2048-ingress2-eb379a0f83-378466616.region-code.elb.amazonaws.com. 
+You should see the 2048 game in your browser. Play!
+
+
+Step 5: Persist Data using the Amazon EBS CSI Driver nodes:
+
+Now that the 2048 game is up and running on your Amazon EKS cluster, it's time to ensure that 
+your game data is safely persisted using the Amazon EBS CSI Driver managed add-on. 
+This add-on was installed on our cluster during the creation process. 
+This integration is essential for preserving game progress and data even as Kubernetes pods or 
+nodes are restarted or replaced.
+
+- Create a Storage Class for the EBS CSI Driver;
+  > kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/aws-ebs-csi-driver/master/examples/kubernetes/dynamic-provisioning/manifests/storageclass.yaml
+
+- Create a Persistent Volume Claim (PVC) to request storage for your game data. Create a file 
+named ebs-pvc.yaml and add the following content to it;
+  > nano ebs-pvc.yaml
+
+`
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: game-data-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: ebs-sc
+
+`
+
+- Apply the PVC to your cluster;
+  > kubectl apply -f ebs-pvc.yaml
+
+- Now, you need to update your 2048 game deployment to use this PVC for storing data. 
+The following deployment is configured to use the PVC for storing game data. 
+Create a file named "ebs-deployment.yaml" and add the following contents to it;
+  > nano ebs-deployment.yaml
+
+`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: game-2048
+  name: deployment-2048
+spec:
+  replicas: 3  # Adjust the number of replicas as needed
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: app-2048
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: app-2048
+    spec:
+      containers:
+        - name: app-2048
+          image: public.ecr.aws/l6m2t8p7/docker-2048:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: game-data
+              mountPath: /var/lib/2048
+      volumes:
+        - name: game-data
+          persistentVolumeClaim:
+            claimName: game-data-pvc
+
+`
+
+- Apply the updated deployment;
+  > kubectl apply -f ebs-deployment.yaml
+
+With these steps, your 2048 game on Amazon EKS is now set up to persist data using the Amazon EBS CSI Driver. 
+This ensures that your game progress and data are safe even in the event of pod or node failures.
+
+-  Step 6: Delete your cluster and nodes:
+
+After you've finished with the cluster and nodes that you created for this tutorial, you should 
+clean up by deleting the cluster and nodes with the following command,
+  > eksctl delete cluster -f ./cluster-config.yaml
+
+
+##################################################################
+
+INSTALL K8S DASHBOARD:
+
+## Kubernetes Dashboard ##
+##########################
+
+Update:
+dashboard url: localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/https:kubernetes-dashboard:/proxy/
+
+- To install k8 dashboard use this command:
+  > kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.2.0/aio/deploy/recommended.yaml
+
+- Verify:
+  > kubectl get all -n kubernetes-dashboard
+
+- create an admin user account:
+  > nano admin-service-account.yaml
+
+`
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eks-course-admin
+  namespace: kube-system
+
+---
+  
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eks-course-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: eks-course-admin
+  namespace: kube-system
+
+`
+
+  > kubectl apply -f admin-service-account.yaml
+
+- access the DASHBOARD:
+  get a security token
+  > kubectl -n kube-system describe secret $(kubectl -n kube-system get secret | grep eks-course-admin | awk '{print $1}')
+  
+  save output.
+  
+  start kube proxy
+  > kubectl proxy
+
+open browser at http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/https:kubernetes-dashboard:/proxy/#!/login
+and choose _token_ as login method, 
+where you have to provide the token you recorded two steps before.
+
+
+RBAC:
+  > nano dashboard-account-rbac.yaml
+
+`
+
+# ------------------- Dashboard Role & Role Binding ------------------- #
+
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: kubernetes-dashboard-minimal
+  namespace: kube-system
+rules:
+  # Allow Dashboard to create 'kubernetes-dashboard-key-holder' secret.
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create"]
+  # Allow Dashboard to create 'kubernetes-dashboard-settings' config map.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["create"]
+  # Allow Dashboard to get, update and delete Dashboard exclusive secrets.
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["kubernetes-dashboard-key-holder", "kubernetes-dashboard-certs"]
+  verbs: ["get", "update", "delete"]
+  # Allow Dashboard to get and update 'kubernetes-dashboard-settings' config map.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["kubernetes-dashboard-settings"]
+  verbs: ["get", "update"]
+  # Allow Dashboard to get metrics from heapster.
+- apiGroups: [""]
+  resources: ["services"]
+  resourceNames: ["heapster"]
+  verbs: ["proxy"]
+- apiGroups: [""]
+  resources: ["services/proxy"]
+  resourceNames: ["heapster", "http:heapster:", "https:heapster:"]
+  verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubernetes-dashboard-minimal
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubernetes-dashboard-minimal
+subjects:
+- kind: ServiceAccount
+  name: kubernetes-dashboard
+  namespace: kube-system
+
+---
+
+`
+
+Apply the RBAC to allow permissions to the entire cluster.
+  > kubectl apply -f dashboard-account-rbac.yaml
+
+
+###OPTIONS:
+
+
+Create a sample user:
+
+- Creating a Service Account;
+  > nano dashboard-adminuser.yaml
+
+`
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-user
+  namespace: kubernetes-dashboard
+
+`
+
+  > kubectl apply -f dashboard-adminuser.yaml
+
+- Creating a ClusterRoleBinding;
+In most cases after provisioning the cluster using kops, kubeadm or any other popular tool, the ClusterRole cluster-admin already exists in the cluster. We can use it and create only a ClusterRoleBinding for our ServiceAccount. 
+If it does not exist then you need to create this role first and grant required privileges manually.
+  > nano clusterrolebinding.yaml
+
+`
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-user
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: admin-user
+  namespace: kubernetes-dashboard
+
+`
+
+  > kubectl apply -f clusterrolebinding.yaml
+
+Getting a Bearer Token for serviceAccounts:
+
+- Now we need to find the token we can use to log in. Execute the following command;
+  > kubectl -n kubernetes-dashboard create token admin-user
+
+Getting a long-lived Bearer Token for serviceAccounts:
+
+  > nano bearertoken.yaml
+
+`
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: admin-user
+  namespace: kubernetes-dashboard
+  annotations:
+    kubernetes.io/service-account.name: "admin-user"   
+type: kubernetes.io/service-account-token  
+
+`
+After Secret is created, we can execute the following command to get the token which saved in the Secret;
+  > kubectl get secret admin-user -n kubernetes-dashboard -o jsonpath={".data.token"} | base64 -d
+
+head to your dashboard login page and login with the token;
+ > http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/https:kubernetes-dashboard:/proxy/#/login
+
+
+######### Q.E.D ##########
+##########################
